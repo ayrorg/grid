@@ -1,0 +1,307 @@
+#!/bin/bash
+#
+# Grid branding - oppsett av ny Mac
+# Versjon 2026-09-29
+#
+#   curl -sL ayrorg.github.io/grid | bash
+#
+# Ingen Homebrew, ingen Xcode. Fungerer på Intel og Apple Silicon.
+#
+set -uo pipefail
+
+BOLD=$'\033[1m'; GRN=$'\033[0;32m'; YEL=$'\033[0;33m'; RED=$'\033[0;31m'; NC=$'\033[0m'
+say()  { printf "\n${BOLD}==> %s${NC}\n" "$*"; }
+ok()   { printf "${GRN}  ok  %s${NC}\n" "$*"; }
+warn() { printf "${YEL}  !   %s${NC}\n" "$*"; }
+err()  { printf "${RED}  x   %s${NC}\n" "$*"; }
+
+TODO=()
+todo() { TODO+=("$1"); }
+
+TMP="$(mktemp -d /tmp/gridsetup.XXXXXX)"
+cleanup() {
+  for m in /Volumes/gridsetup-*; do
+    [ -d "$m" ] && hdiutil detach "$m" -quiet -force 2>/dev/null
+  done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------------ Forhåndssjekk
+clear
+printf "${BOLD}Grid branding - oppsett av ny Mac${NC}\n"
+
+[ "$(uname)" = "Darwin" ] || { err "Kjører bare på macOS."; exit 1; }
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+  arm64)  ARCHNAME="Apple Silicon" ;;
+  x86_64) ARCHNAME="Intel" ;;
+  *)      err "Ukjent arkitektur: $ARCH"; exit 1 ;;
+esac
+
+curl -fsI --max-time 8 https://www.google.com >/dev/null 2>&1 \
+  || { err "Ingen nettforbindelse. Koble til wifi og prøv igjen."; exit 1; }
+
+ok "macOS $(sw_vers -productVersion) - $ARCHNAME - nett OK"
+
+# ------------------------------------------------------------ Rolle
+say "Hvilken rolle skal maskinen settes opp for?"
+cat <<'MENU'
+   1) Alle ansatte  (kun basis)
+   2) Rådgiver
+   3) Kreatør
+   4) Prosjektleder
+MENU
+while :; do
+  read -r -p "  Velg 1-4: " N </dev/tty
+  case "$N" in
+    1) ROLE="Alle ansatte";  break ;;
+    2) ROLE="Rådgiver";      break ;;
+    3) ROLE="Kreatør";       break ;;
+    4) ROLE="Prosjektleder"; break ;;
+    *) warn "Skriv 1, 2, 3 eller 4." ;;
+  esac
+done
+ok "Rolle: $ROLE"
+
+# ------------------------------------------------------------ Admin
+say "Administratorpassord"
+echo "  Du blir bedt om passordet til denne maskinen."
+echo "  Det vises ingenting mens du skriver - det er normalt."
+sudo -v </dev/tty || { err "Trenger administratorrettigheter."; exit 1; }
+while :; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
+SUDO_KEEPALIVE=$!
+
+# ------------------------------------------------------------ Hjelpefunksjoner
+
+# Sjekker at en URL faktisk svarer før vi laster ned
+url_ok() { curl -fsI --max-time 15 "$1" >/dev/null 2>&1; }
+
+fetch() {  # fetch <url> <målfil>
+  curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 \
+       --progress-bar -o "$2" "$1"
+}
+
+unquarantine() { xattr -dr com.apple.quarantine "$1" 2>/dev/null; }
+
+# Monterer et DMG og skriver monteringspunktet til stdout
+mount_dmg() {
+  local dmg="$1" mp
+  mp="/Volumes/gridsetup-$RANDOM"
+  if hdiutil attach "$dmg" -nobrowse -quiet -mountpoint "$mp" \
+       -noverify -noautoopen 2>/dev/null; then
+    echo "$mp"; return 0
+  fi
+  return 1
+}
+
+# install_app <navn> <url> [nedlastingsside]
+# Håndterer DMG med .app, DMG med .pkg, og .zip med .app
+install_app() {
+  local label="$1" url="$2" page="${3:-}"
+  local file ext mp app pkg
+
+  if [ -d "/Applications/$label.app" ]; then
+    ok "$label (allerede installert)"
+    return 0
+  fi
+
+  printf "  ... %s\n" "$label"
+
+  if ! url_ok "$url"; then
+    err "$label - nedlastingslenken svarer ikke"
+    if [ -n "$page" ]; then
+      todo "Installer $label manuelt: $page"
+    else
+      todo "Installer $label manuelt"
+    fi
+    return 1
+  fi
+
+  case "$url" in
+    *.zip) ext="zip" ;;
+    *)     ext="dmg" ;;
+  esac
+  file="$TMP/$(echo "$label" | tr ' ' '_').$ext"
+
+  if ! fetch "$url" "$file"; then
+    err "$label - nedlasting feilet"
+    todo "Installer $label manuelt${page:+: $page}"
+    return 1
+  fi
+
+  if [ "$ext" = "zip" ]; then
+    if ditto -x -k "$file" "$TMP/unzip_$$" 2>/dev/null; then
+      app="$(find "$TMP/unzip_$$" -maxdepth 2 -name '*.app' -print -quit)"
+      if [ -n "$app" ]; then
+        rm -rf "/Applications/$(basename "$app")"
+        if sudo cp -R "$app" /Applications/; then
+          unquarantine "/Applications/$(basename "$app")"
+          ok "$label"
+          rm -rf "$TMP/unzip_$$"
+          return 0
+        fi
+      fi
+    fi
+    err "$label - utpakking feilet"
+    todo "Installer $label manuelt${page:+: $page}"
+    return 1
+  fi
+
+  mp="$(mount_dmg "$file")" || {
+    err "$label - kunne ikke åpne DMG"
+    todo "Installer $label manuelt${page:+: $page}"
+    return 1
+  }
+
+  pkg="$(find "$mp" -maxdepth 2 \( -name '*.pkg' -o -name '*.mpkg' \) -print -quit)"
+  app="$(find "$mp" -maxdepth 2 -name '*.app' -print -quit)"
+
+  if [ -n "$pkg" ]; then
+    if sudo installer -pkg "$pkg" -target / >/dev/null 2>&1; then
+      ok "$label"
+    else
+      err "$label - installasjon feilet"
+      todo "Installer $label manuelt${page:+: $page}"
+    fi
+  elif [ -n "$app" ]; then
+    rm -rf "/Applications/$(basename "$app")"
+    if sudo cp -R "$app" /Applications/; then
+      unquarantine "/Applications/$(basename "$app")"
+      ok "$label"
+    else
+      err "$label - kopiering feilet"
+      todo "Installer $label manuelt${page:+: $page}"
+    fi
+  else
+    warn "$label - fant verken app eller pakke, åpner DMG-et"
+    open "$mp"
+    todo "Fullfør installasjonen av $label manuelt"
+    return 0
+  fi
+
+  hdiutil detach "$mp" -quiet -force 2>/dev/null
+}
+
+add_to_dock() {
+  local path="$1"
+  [ -d "$path" ] || return 1
+  defaults read com.apple.dock persistent-apps 2>/dev/null \
+    | grep -q "$(basename "$path")" && return 0
+  defaults write com.apple.dock persistent-apps -array-add \
+    "<dict><key>tile-data</key><dict><key>file-data</key><dict>\
+<key>_CFURLString</key><string>$path</string>\
+<key>_CFURLStringType</key><integer>0</integer></dict></dict></dict>"
+}
+
+# ------------------------------------------------------------ Basis
+say "Basisprogrammer (alle ansatte)"
+
+install_app "Google Chrome" \
+  "https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg" \
+  "https://www.google.com/chrome/"
+
+install_app "Google Drive" \
+  "https://dl.google.com/drive-file-stream/GoogleDrive.dmg" \
+  "https://www.google.com/drive/download/"
+
+# ------------------------------------------------------------ Chrome-oppsett
+say "Chrome-oppsett"
+if [ -d "/Applications/Google Chrome.app" ]; then
+  add_to_dock "/Applications/Google Chrome.app" && ok "Lagt til i Dock"
+  killall Dock 2>/dev/null
+  open -a "Google Chrome" --args --make-default-browser 2>/dev/null
+  todo "Bekreft dialogen om at Chrome skal være standard nettleser"
+else
+  todo "Installer Chrome, sett den som standard nettleser og legg den i Dock"
+fi
+
+# ------------------------------------------------------------ Ricoh
+say "Ricoh-printer"
+install_app "Ricoh PS Printers" \
+  "https://support.ricoh.com/bb/pub_e/dr_ut_e/0001316/0001316696/V4000/Ricoh_PS_Printers_Vol4_EXP_LIO_4.0.0.0.dmg" \
+  "https://support.ricoh.com/"
+todo "Legg til Ricoh-printeren i Systeminnstillinger og ta en testutskrift"
+
+# ------------------------------------------------------------ Rollespesifikt
+case "$ROLE" in
+  "Rådgiver"|"Prosjektleder")
+    say "Adobe Acrobat Pro"
+    echo "  Acrobat Pro krever innlogging og lisens."
+    echo "  Åpner Adobe sin nedlastingsside."
+    open "https://creativecloud.adobe.com/apps/download/creative-cloud" 2>/dev/null
+    todo "Logg inn på brukerens Adobe-konto"
+    todo "Installer Adobe Acrobat Pro via Creative Cloud-appen"
+    ;;
+  "Kreatør")
+    say "Kreatørprogrammer"
+
+    if [ "$ARCH" = "arm64" ]; then
+      FIGMA_URL="https://desktop.figma.com/mac-arm/Figma.zip"
+    else
+      FIGMA_URL="https://desktop.figma.com/mac/Figma.zip"
+    fi
+    install_app "Figma" "$FIGMA_URL" "https://www.figma.com/downloads/"
+
+    echo "  Adobe og Connect Fonts krever innlogging - åpner sidene."
+    open "https://creativecloud.adobe.com/apps/download/creative-cloud" 2>/dev/null
+    sleep 1
+    open "https://www.extensis.com/support/connect-fonts" 2>/dev/null
+    sleep 1
+    open "https://www.canon.no/support/products/imageprograf/imageprograf-pro-4100s.html?type=drivers&language=no" 2>/dev/null
+
+    todo "Logg inn på brukerens Adobe-konto"
+    todo "Installer Creative Cloud-appene brukeren trenger"
+    todo "Installer Connect Fonts (Suitcase Fusion)"
+    todo "Installer Canon Pro-4100s-driver (velg under Individuelle drivere) og test utskrift"
+    todo "Valgfritt: FormZ og AutoCAD hvis brukeren trenger det"
+    ;;
+esac
+
+# ------------------------------------------------------------ FileVault
+say "FileVault"
+if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+  ok "FileVault er på"
+else
+  warn "FileVault er ikke aktivert"
+  open "x-apple.systempreferences:com.apple.preference.security?FileVault" 2>/dev/null
+  todo "Aktiver FileVault og lagre gjenopprettingsnøkkelen i brukerens Min disk"
+fi
+
+# ------------------------------------------------------------ Faste punkter
+todo "Sjekk at Admin-kontoen finnes (passord i 1Password)"
+todo "Sjekk at brukeren har fullt navn som brukernavn og administratorrettigheter"
+todo "Merk maskinen: Fornavn-Årstall, f.eks. Henning-2026"
+todo "Oppdater IT-arket"
+
+# ------------------------------------------------------------ Sjekkliste
+kill "$SUDO_KEEPALIVE" 2>/dev/null
+
+LOG="$HOME/Desktop/Gjenstår - maskinoppsett.txt"
+{
+  echo "Grid branding - oppsett av ny Mac"
+  echo "Rolle:  $ROLE"
+  echo "Maskin: $ARCHNAME, macOS $(sw_vers -productVersion)"
+  echo "Kjørt:  $(date '+%d.%m.%Y kl. %H:%M')"
+  echo
+  echo "GJENSTÅR:"
+} > "$LOG"
+
+printf "\n${BOLD}────────────────────────────────────────────${NC}\n"
+printf "${BOLD}Gjenstår - %s${NC}\n" "$ROLE"
+printf "${BOLD}────────────────────────────────────────────${NC}\n"
+i=1
+for t in ${TODO[@]+"${TODO[@]}"}; do
+  printf "  %2d. %s\n" "$i" "$t"
+  printf "  [ ] %s\n" "$t" >> "$LOG"
+  i=$((i + 1))
+done
+
+{
+  echo
+  echo "Rutinedokumentet og IT-arket ligger i Google Disk."
+} >> "$LOG"
+
+printf "\n${GRN}Lista er lagret på skrivebordet som:${NC}\n"
+printf "${GRN}  Gjenstår - maskinoppsett.txt${NC}\n\n"
