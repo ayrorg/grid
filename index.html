@@ -184,15 +184,39 @@ install_app() {
   hdiutil detach "$mp" -quiet -force 2>/dev/null
 }
 
-add_to_dock() {
-  local path="$1"
-  [ -d "$path" ] || return 1
-  defaults read com.apple.dock persistent-apps 2>/dev/null \
-    | grep -q "$(basename "$path")" && return 0
-  defaults write com.apple.dock persistent-apps -array-add \
-    "<dict><key>tile-data</key><dict><key>file-data</key><dict>\
-<key>_CFURLString</key><string>$path</string>\
+# Apper som skal ligge i Dock-en, i rekkefølge. Fylles underveis.
+DOCK=()
+
+# dock_want <navn> <sti> [flere stier ...]
+# Legger til første sti som faktisk finnes. Finner den ingen, blir det et TODO.
+dock_want() {
+  local label="$1"; shift
+  local p
+  for p in "$@"; do
+    if [ -d "$p" ]; then
+      DOCK+=("$p")
+      return 0
+    fi
+  done
+  todo "Legg $label i Dock-en når den er installert"
+  return 1
+}
+
+# Tømmer Dock-en for apper og legger inn DOCK-lista i stedet.
+# Finder og Papirkurv ligger utenfor persistent-apps og blir stående.
+rebuild_dock() {
+  local p entries=""
+  defaults write com.apple.dock persistent-apps -array
+  for p in ${DOCK[@]+"${DOCK[@]}"}; do
+    defaults write com.apple.dock persistent-apps -array-add \
+      "<dict><key>tile-data</key><dict><key>file-data</key><dict>\
+<key>_CFURLString</key><string>$p</string>\
 <key>_CFURLStringType</key><integer>0</integer></dict></dict></dict>"
+    entries="$entries $(basename "$p" .app),"
+  done
+  killall Dock 2>/dev/null
+  sleep 1
+  ok "Dock:${entries%,}"
 }
 
 # ------------------------------------------------------------ Basis
@@ -207,14 +231,13 @@ install_app "Google Drive" \
   "https://www.google.com/drive/download/"
 
 # ------------------------------------------------------------ Chrome-oppsett
-say "Chrome-oppsett"
+say "Chrome som standard nettleser"
 if [ -d "/Applications/Google Chrome.app" ]; then
-  add_to_dock "/Applications/Google Chrome.app" && ok "Lagt til i Dock"
-  killall Dock 2>/dev/null
   open -a "Google Chrome" --args --make-default-browser 2>/dev/null
+  ok "Chrome åpnet"
   todo "Bekreft dialogen om at Chrome skal være standard nettleser"
 else
-  todo "Installer Chrome, sett den som standard nettleser og legg den i Dock"
+  todo "Installer Chrome og sett den som standard nettleser"
 fi
 
 # ------------------------------------------------------------ Ricoh
@@ -258,6 +281,32 @@ case "$ROLE" in
     todo "Valgfritt: FormZ og AutoCAD hvis brukeren trenger det"
     ;;
 esac
+
+# ------------------------------------------------------------ Dock
+say "Bygger Dock-en"
+echo "  Alle Apples standardapper fjernes fra Dock-en."
+echo "  Finder og Papirkurv blir stående."
+
+dock_want "Google Chrome" "/Applications/Google Chrome.app"
+dock_want "Google Disk"   "/Applications/Google Drive.app"
+
+case "$ROLE" in
+  "Kreatør")
+    dock_want "Figma" "/Applications/Figma.app"
+    dock_want "Adobe Creative Cloud" \
+      "/Applications/Adobe Creative Cloud/Adobe Creative Cloud.app" \
+      "/Applications/Utilities/Adobe Creative Cloud/ACC/Creative Cloud.app"
+    ;;
+  "Rådgiver"|"Prosjektleder")
+    # Acrobat installeres manuelt via Creative Cloud, så den finnes
+    # sjelden ennå. Da havner den i sjekklisten i stedet.
+    dock_want "Adobe Acrobat" \
+      "/Applications/Adobe Acrobat DC/Adobe Acrobat.app" \
+      "/Applications/Adobe Acrobat.app"
+    ;;
+esac
+
+rebuild_dock
 
 # ------------------------------------------------------------ FileVault
 say "FileVault"
