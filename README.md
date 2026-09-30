@@ -1,2 +1,2 @@
 # grid
-Oppsett av nye Mac-er for Grid branding. Kjor: curl -sL ayrorg.github.io/grid | bash
+Oppsett av nye Mac-er for Grid. Kjor: curl -sL ayrorg.github.io/grid | bash
